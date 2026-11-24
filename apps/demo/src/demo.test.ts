@@ -16,10 +16,26 @@ describe("runDemo", () => {
     const result = await runDemo();
 
     expect(result.mock).toBe(true);
+    expect(result.sponsorReadings).toEqual([
+      expect.objectContaining({ stale: false, balanceStroops: "1000000000" }),
+    ]);
     expect(result.challenge.amount).toBe("10000");
     expect(result.receipt.receipt.model).toBe("x402");
     expect(result.receipt.receipt.settlement.kind).toBe("transaction");
     expect(result.receiptValid).toBe(true);
+  });
+
+  it("uses an injected reader in mock mode and reports the startup reading", async () => {
+    const reader = vi.fn(async () => "123456789");
+    const onSponsorReading = vi.fn();
+    const result = await runDemo({
+      env: { MOCK_MODE: "true" },
+      sponsorBalanceReader: reader,
+      onSponsorReading,
+    });
+    expect(reader).toHaveBeenCalledOnce();
+    expect(onSponsorReading).toHaveBeenCalledExactlyOnceWith(result.sponsorReadings[0]);
+    expect(result.sponsorReadings[0]).toMatchObject({ balanceStroops: "123456789", stale: false });
   });
 });
 
@@ -31,8 +47,11 @@ describe("runDemo", () => {
 describe("runDemo in live mode", () => {
   const recipient = Keypair.random().publicKey();
   const payerKeypair = Keypair.random();
+  const sponsorBalanceReader = vi.fn(async () => "1000000000");
   const realFetch = globalThis.fetch;
   let facilitatorCalls: Array<{ url: string; headers: Headers }>;
+  // What the stub answers on /supported: OpenZeppelin Channels' shape by default.
+  let supportedKinds: unknown[];
 
   // Signs nothing: returns a V2 payload with a fixed transaction, so no
   // Stellar RPC is needed.
@@ -44,20 +63,30 @@ describe("runDemo in live mode", () => {
 
   beforeEach(() => {
     facilitatorCalls = [];
+    supportedKinds = [
+      {
+        x402Version: 2,
+        scheme: "exact",
+        network: "stellar:testnet",
+        extra: { areFeesSponsored: true },
+      },
+    ];
     vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : input.toString();
       if (url.startsWith("http://127.0.0.1:")) {
         return realFetch(input, init);
       }
       facilitatorCalls.push({ url, headers: new Headers(init?.headers) });
-      const body = url.endsWith("/verify")
-        ? { isValid: true, payer: payerKeypair.publicKey() }
-        : {
-            success: true,
-            transaction: "a".repeat(64),
-            network: "stellar:testnet",
-            payer: payerKeypair.publicKey(),
-          };
+      const body = url.endsWith("/supported")
+        ? { kinds: supportedKinds, extensions: [], signers: { "stellar:testnet": [recipient] } }
+        : url.endsWith("/verify")
+          ? { isValid: true, payer: payerKeypair.publicKey() }
+          : {
+              success: true,
+              transaction: "a".repeat(64),
+              network: "stellar:testnet",
+              payer: payerKeypair.publicKey(),
+            };
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -71,9 +100,12 @@ describe("runDemo in live mode", () => {
       "OZ_API_KEY",
       "STELLAR_RECIPIENT",
       "STELLAR_SECRET_KEY",
+      "FEE_SPONSOR_ACCOUNTS",
+      "FEE_SPONSOR_THRESHOLD_STROOPS",
     ]) {
       vi.stubEnv(name, undefined);
     }
+    sponsorBalanceReader.mockClear();
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -88,7 +120,10 @@ describe("runDemo in live mode", () => {
 
   it("calls the testnet facilitator in live mode", async () => {
     stubLiveEnv();
-    await runDemo({ payer });
+    const onSponsorReading = vi.fn();
+    await runDemo({ payer, sponsorBalanceReader, onSponsorReading });
+    expect(sponsorBalanceReader).toHaveBeenCalledExactlyOnceWith(recipient, "testnet");
+    expect(onSponsorReading).toHaveBeenCalledOnce();
 
     expect(facilitatorCalls[0]?.url).toMatch(
       /^https:\/\/channels\.openzeppelin\.com\/x402\/testnet\//,
@@ -97,7 +132,7 @@ describe("runDemo in live mode", () => {
 
   it("sends the API key on verify", async () => {
     stubLiveEnv();
-    await runDemo({ payer });
+    await runDemo({ payer, sponsorBalanceReader });
 
     const verify = facilitatorCalls.find((call) => call.url.endsWith("/verify"));
     expect(verify?.headers.get("Authorization")).toBe("Bearer k");
@@ -105,9 +140,35 @@ describe("runDemo in live mode", () => {
 
   it("uses the USDC SAC address as the asset", async () => {
     stubLiveEnv();
-    const result = await runDemo({ payer });
+    const result = await runDemo({ payer, sponsorBalanceReader });
 
     expect(result.challenge.asset).toBe(USDC_TESTNET_ADDRESS);
+  });
+
+  it("checks the facilitator's capabilities before serving and reports the result", async () => {
+    stubLiveEnv();
+    const result = await runDemo({ payer, sponsorBalanceReader });
+
+    expect(facilitatorCalls[0]?.url).toMatch(/\/supported$/);
+    expect(facilitatorCalls[0]?.headers.get("Authorization")).toBe("Bearer k");
+    expect(result.facilitatorCheck).toEqual({
+      status: "ok",
+      routes: { "GET /quotes/latest": { status: "valid" } },
+      mismatches: [],
+    });
+  });
+
+  it("refuses to start when the facilitator does not support the paywall", async () => {
+    stubLiveEnv();
+    supportedKinds = [{ x402Version: 2, scheme: "exact", network: "eip155:8453" }];
+
+    await expect(runDemo({ payer })).rejects.toMatchObject({
+      name: "FacilitatorCheckError",
+      code: "facilitator-unsupported",
+    });
+    expect(facilitatorCalls.map((call) => call.url)).toEqual([
+      expect.stringMatching(/\/supported$/),
+    ]);
   });
 
   it("reports every missing variable in live mode without calling the network", async () => {

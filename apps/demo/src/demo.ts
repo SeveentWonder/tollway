@@ -4,23 +4,28 @@ import {
   Ed25519Signer,
   Ed25519Verifier,
   type SignedReceipt,
+  type SponsorBalanceReading,
   type StellarNetwork,
   verifyReceipt,
 } from "@vegaforge/tollway-core";
 import {
+  createFacilitatorValidator,
   createHttpFacilitator,
   createInMemorySettlementCache,
   createMockFacilitator,
   createPaywall,
+  createSponsorMonitor,
   decodeHeader,
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
   encodePaymentSignatureHeader,
+  type FacilitatorCheckReport,
   type FacilitatorClient,
   PAYMENT_REQUIRED_HEADER,
   PAYMENT_RESPONSE_HEADER,
   PAYMENT_SIGNATURE_HEADER,
   type PaywallConfig,
+  type SponsorBalanceReader,
   TOLLWAY_RECEIPT_HEADER,
 } from "@vegaforge/tollway-server";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
@@ -45,14 +50,28 @@ export type DemoOptions = {
   env?: DemoEnv;
   /** Overrides the live-mode payer. Tests use it to avoid Stellar RPC. */
   payer?: DemoPayer;
+  /** Overrides the Horizon reader. Mock mode defaults to an offline fake. */
+  sponsorBalanceReader?: SponsorBalanceReader;
+  /** Called before serving. Defaults to printing the reading to the console. */
+  onSponsorReading?: (reading: SponsorBalanceReading) => void;
 };
 
 export type DemoResult = {
   mock: boolean;
+  sponsorReadings: readonly SponsorBalanceReading[];
   challenge: { amount: string; asset: string; resource: string };
   receipt: SignedReceipt;
   receiptValid: boolean;
+  /**
+   * Live mode only: the facilitator capability check run before serving.
+   * Mock mode skips it, since its placeholder accounts are not real
+   * Stellar addresses.
+   */
+  facilitatorCheck?: FacilitatorCheckReport;
 };
+
+/** The route the demo serves, as the capability report labels it. */
+const DEMO_ROUTE = "GET /quotes/latest";
 
 /** Price of the demo quote: 0.001 USDC in 7-decimal base units. */
 const DEMO_AMOUNT = "10000";
@@ -159,6 +178,42 @@ export async function runDemo(options: DemoOptions = {}): Promise<DemoResult> {
     extra: SPONSORED_FEES,
   };
 
+  // Live mode asks the facilitator what it supports before serving, and
+  // refuses to start on a mismatch, so a misconfigured route is not first
+  // discovered by a paying agent.
+  const facilitatorCheck = mock
+    ? undefined
+    : await createFacilitatorValidator(facilitator, { mode: "fail" }).check({
+        [DEMO_ROUTE]: config,
+      });
+
+  const env = options.env ?? process.env;
+  const explicitSponsors = env.FEE_SPONSOR_ACCOUNTS;
+  const sponsorReadings = await createSponsorMonitor({
+    network: paywall.network,
+    accounts:
+      explicitSponsors === undefined
+        ? mock
+          ? ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"]
+          : undefined
+        : explicitSponsors.split(",").map((account) => account.trim()),
+    facilitator,
+    thresholdStroops: env.FEE_SPONSOR_THRESHOLD_STROOPS ?? "10000000",
+    readBalance: options.sponsorBalanceReader ?? (mock ? async () => "1000000000" : undefined),
+    sink: {
+      recordSponsorBalance(reading) {
+        if (options.onSponsorReading) options.onSponsorReading(reading);
+        else
+          console.log(
+            `Fee sponsor ${reading.account} (${reading.network}): ${reading.stale ? `stale: ${reading.error}` : `${reading.balanceStroops} stroops`}`,
+          );
+      },
+      emit(event) {
+        console.warn("Fee sponsor below threshold:", event.data);
+      },
+    },
+  }).poll();
+
   const gate = createPaywall(config, {
     signer,
     facilitator,
@@ -206,6 +261,7 @@ export async function runDemo(options: DemoOptions = {}): Promise<DemoResult> {
 
     return {
       mock,
+      sponsorReadings,
       challenge: {
         amount: requirements.amount,
         asset: requirements.asset,
@@ -213,6 +269,7 @@ export async function runDemo(options: DemoOptions = {}): Promise<DemoResult> {
       },
       receipt,
       receiptValid: verification.valid,
+      ...(facilitatorCheck ? { facilitatorCheck } : {}),
     };
   } finally {
     await new Promise((resolve) => server.close(resolve));
